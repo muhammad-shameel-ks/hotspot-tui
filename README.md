@@ -66,5 +66,7 @@ repo's `create_ap` route, including:
   (`ieee80211n` / `wmm_enabled` / `ieee80211ac` + VHT centre index table),
 - DHCP/DNS/NAT/firewall plumbing,
 - verification with expected `iw dev ap0 station dump` output,
+- a self-healing watchdog for an AP that silently loses its radio while
+  hostapd keeps running,
 - a symptom → cause table for everything above.
 

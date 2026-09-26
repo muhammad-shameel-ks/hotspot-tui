@@ -304,12 +304,99 @@ VHT80 will not be the bottleneck for a typical ≤100 Mbit/s plan.
 | DHCP works, no internet | `net.ipv4.ip_forward=0`, or missing `MASQUERADE`/FORWARD rules |
 | AP dies when Wi-Fi is rescanned | `ap0` not marked unmanaged in NetworkManager |
 | Works, then clients drop together | DFS radar detection on a DFS channel — move to 36–48 |
+| AP is "running" but no client can see or join it | hostapd survived while the phy dropped the vif's channel (radio reset, rfkill toggle, something else taking the phy). `iw dev ap0 info` shows **no `channel:` line**; restarting fixes it until it happens again — set up the watchdog in §13 |
+| AP comes up on 2.4 GHz although no station is connected | A managed vif can report a channel left over from a scan, and mirroring it drags the AP onto that band. Gate mirroring on an actual association: `iw dev wlp1s0 link \| grep -q '^Connected'` before reading channel/width |
 | 2.4 GHz-only client cannot see the AP | The AP is 5 GHz only — expected |
 | Works on AC, not on battery | Power-saving / regulatory-power limits on some drivers; test on AC |
 
 ---
 
-## 13. Teardown
+## 13. Keeping the AP honest (self-healing)
+
+A hotspot left running for hours fails quietly in two ways, and both present as
+"the AP is on" while nothing works.
+
+### 13.1 hostapd alive, vif dead
+
+`iw dev ap0 info` printing **no `channel:` line** means the phy dropped the AP's
+channel context while hostapd kept running and kept reporting `AP-ENABLED`. The
+systemd unit stays `active`, so any status built on unit state alone lies, and
+the AP never comes back until someone restarts it by hand.
+
+Make the state honest — the AP counts as up only when hostapd runs **and** the
+vif holds a channel:
+
+```sh
+ap_up() {
+  systemctl is-active --quiet my-hotspot &&
+    iw dev ap0 info 2>/dev/null | grep -q 'channel'
+}
+```
+
+Then add a watchdog plus a marker, so that a hotspot the user switched off
+stays off:
+
+```sh
+# on a successful start: the AP is wanted
+: >/run/my-hotspot/enabled
+# on an explicit user stop: forget it
+rm -f /run/my-hotspot/enabled
+
+watchdog() {
+  [ -e /run/my-hotspot/enabled ] || return 0   # user wants it off
+  ap_up && return 0
+  logger -t my-hotspot "wanted but not serving; restarting"
+  stop_ap        # teardown must NOT clear the marker: a restart that fails
+  start_ap       # (radio still rfkill'd) has to keep retrying
+}
+```
+
+Drive it from a timer:
+
+```ini
+# /etc/systemd/system/my-hotspot-watchdog.timer
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=30
+
+[Install]
+WantedBy=timers.target
+```
+
+```sh
+sudo systemctl enable --now my-hotspot-watchdog.timer
+journalctl -u my-hotspot-watchdog -f
+```
+
+The subtle part is the marker: clear it in the *stop* path that a user action
+calls, never in the shared teardown the watchdog uses. A first version that
+clears it on every stop loses the intent the first time a restart fails, and
+then the watchdog sits idle while the AP stays dead.
+
+Prove the repair works without touching hardware:
+
+```sh
+nmcli radio wifi off      # the phy goes away, ap0 loses its channel
+nmcli radio wifi on       # the watchdog should restore the AP within ~30 s
+```
+
+While the radio is off, `iw dev ap0 info` has no channel, the status reports
+`off`, and hostapd is still `active` — exactly the silent state this section
+exists for.
+
+### 13.2 Log the band you picked
+
+When the AP comes up on the wrong band, a record is worth having: the caller
+(panel, TUI) usually swallows stderr, so write the decision to the journal.
+
+```sh
+logger -t my-hotspot "serving ap0: hw_mode=a channel=36 width=80 ht=[HT40+]"
+```
+
+`journalctl -t my-hotspot` then answers "why is it on 2.4 GHz this time?" — for
+example because a stale station channel was mirrored (§12).
+
+## 14. Teardown
 
 ```sh
 sudo systemctl stop my-hotspot
@@ -323,7 +410,7 @@ sudo iptables -t nat -D POSTROUTING -s 10.42.0.0/24 ! -d 10.42.0.0/24 -j MASQUER
 
 ---
 
-## 14. Alternatives
+## 15. Alternatives
 
 ### NetworkManager one-liner
 
@@ -369,7 +456,7 @@ HT_CAPAB=[HT40+]
 
 ---
 
-## 15. Reference numbers
+## 16. Reference numbers
 
 Measured on: Intel Wireless 8265 (`iwlwifi`), 5 GHz channel 36, VHT80, phone as
 client one metre away, 50 Mbit/s uplink:
